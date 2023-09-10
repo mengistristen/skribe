@@ -11,6 +11,7 @@ use skribe::request::AuthenticateRequest;
 use skribe::response::AuthenticateResponse;
 use std::fs;
 use std::path::Path;
+use tracing::{debug, instrument};
 
 /// The base URL for making API requests.
 static BASE_URL: Lazy<String> =
@@ -32,6 +33,8 @@ fn get_token(
         return Ok(restore_result.unwrap());
     }
 
+    debug!("failed to restore token, authenticating with the server");
+
     fetch_token(username, auth_token_path, private_key_path, client)
 }
 
@@ -41,15 +44,25 @@ fn restore_token(
     auth_token_path: &str,
     client: &reqwest::blocking::Client,
 ) -> anyhow::Result<String> {
+    debug!("attempting to restore token from {:?}", auth_token_path);
+
     let auth_token = fs::read_to_string(auth_token_path).context("failed to read auth token")?;
+
+    debug!("successfully read token");
+
     let res = client
-        .get(format!("{}/tokens/validate", *BASE_URL))
+        .get(format!("{}/tokens/validation", *BASE_URL))
+        .bearer_auth(&auth_token)
         .send()
         .context("request for token validation failed")?;
 
     if res.status().is_success() {
+        debug!("successfully validated token");
+
         Ok(auth_token)
     } else {
+        debug!("failed to validate token");
+
         Err(anyhow!("failed to validate token"))
     }
 }
@@ -74,8 +87,14 @@ fn fetch_token(
             .json::<AuthenticateResponse>()
             .context("failed to parse auth response")?;
         let token = decrypt_token(&res.token, private_key_path)?;
+        let data_directory_path = Path::new(auth_token_path)
+            .parent()
+            .context("failed to get directory path")?;
 
+        fs::create_dir_all(data_directory_path).context("failed to create data directory")?;
         fs::write(auth_token_path, &token).context("failed to write auth token")?;
+
+        debug!("successfully authenticated with the server");
 
         Ok(token)
     } else {
@@ -117,12 +136,27 @@ fn get_config_base_path() -> anyhow::Result<String> {
         Ok(path)
     } else if let Some(home) = dirs::home_dir() {
         Ok(home
-            .join(".local/share")
+            .join(".config")
             .to_str()
             .ok_or_else(|| anyhow!("failed to find local config path"))?
             .to_owned())
     } else {
         Err(anyhow!("failed to find config file path"))
+    }
+}
+
+/// Finds the location for this app's local data.
+fn get_data_base_path() -> anyhow::Result<String> {
+    if let Ok(path) = std::env::var("XDG_DATA_HOME") {
+        Ok(path)
+    } else if let Some(home) = dirs::home_dir() {
+        Ok(home
+            .join(".local/share")
+            .to_str()
+            .ok_or_else(|| anyhow!("failed to find local data path"))?
+            .to_owned())
+    } else {
+        Err(anyhow!("failed to find local data path"))
     }
 }
 
@@ -141,16 +175,26 @@ fn perform_protected_call(token: &str, client: &reqwest::blocking::Client) -> an
 }
 
 fn main() {
+    // setup logging
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter("client=debug")
+        .with_target(false)
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber).expect("failed to set global default");
+
     // determine config file paths
     let config_base_path = get_config_base_path().expect("couldn't find the config base path");
-    let application_config_path = Path::new(&config_base_path).join(".skribe");
+    let data_base_path = get_data_base_path().expect("couldn't find the data base path");
+    let application_config_path = Path::new(&config_base_path).join("skribe");
+    let application_base_path = Path::new(&data_base_path).join("skribe");
     let config_file_path = application_config_path.join("config.toml");
-    let auth_token_path = application_config_path.join("auth_token");
+    let auth_token_path = application_base_path.join("auth_token");
 
     // load config items
     let config = Config::builder()
         .add_source(
-            File::from(config_file_path)
+            File::from(config_file_path.clone())
                 .required(true)
                 .format(FileFormat::Toml),
         )
@@ -166,6 +210,9 @@ fn main() {
         .to_str()
         .expect("couldn't parse auth token path")
         .to_owned();
+
+    debug!("config file path: {:?}", config_file_path);
+    debug!("auth token path: {:?}", auth_token_path);
 
     // use the same http client for all requests
     let client = reqwest::blocking::Client::new();

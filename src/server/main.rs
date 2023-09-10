@@ -23,8 +23,12 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
+use tracing::{debug, error, info, instrument, warn};
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{filter::EnvFilter, layer::SubscriberExt, Registry};
 
 /// The shared state for the application.
+#[derive(Debug)]
 struct AppState {
     /// A temporary map of usernames to their associated public keys.
     keys: HashMap<String, String>,
@@ -123,33 +127,48 @@ where
 }
 
 /// Creates a new JWT. The token will expire in one hour.
-fn create_token() -> String {
+fn create_token() -> Result<String, AuthError> {
     let now = chrono::Utc::now().timestamp();
     let exp = now + (60 * 60);
     let claims = Claims { exp: exp as usize };
     let token = jsonwebtoken::encode(&Header::default(), &claims, &KEYS.encoding);
 
-    token.unwrap()
+    match token {
+        Ok(token) => Ok(token),
+        Err(_) => Err(AuthError::OperationFailed),
+    }
 }
 
 /// Encrypts the given JWT using the user's public key.
+#[instrument(skip(token, public_key))]
 fn encrypt_token(token: String, public_key: &String) -> Result<String, AuthError> {
-    let key = rsa::Rsa::public_key_from_pem(public_key.as_bytes())
-        .map_err(|_| AuthError::InvalidKeyFormat)?;
+    let key = rsa::Rsa::public_key_from_pem(public_key.as_bytes()).map_err(|_| {
+        warn!("public key was not in a valid format");
+        AuthError::InvalidKeyFormat
+    })?;
     let mut buf = vec![0; key.size() as usize];
 
     key.public_encrypt(token.as_bytes(), &mut buf, rsa::Padding::PKCS1)
-        .map_err(|_| AuthError::OperationFailed)?;
+        .map_err(|_| {
+            error!("failed to encrypt jwt using public key");
+            AuthError::OperationFailed
+        })?;
 
     Ok(BASE64_URL_SAFE.encode(buf))
 }
 
 /// Stores the user's public key for authentication.
+#[instrument(skip(state, payload))]
 async fn add_key(
     Extension(state): Extension<Arc<RwLock<AppState>>>,
     Json(payload): Json<AddKeyRequest>,
 ) -> Result<StatusCode, AuthError> {
-    let mut state = state.write().map_err(|_| AuthError::OperationFailed)?;
+    debug!("uploading public key for user {:?}", payload.username);
+
+    let mut state = state.write().map_err(|err| {
+        error!("error acquiring the lock for app state: {:?}", err);
+        AuthError::OperationFailed
+    })?;
 
     state.keys.insert(payload.username, payload.public_key);
 
@@ -157,25 +176,33 @@ async fn add_key(
 }
 
 /// Uses the user's public key to encrypt a JWT access token.
+#[instrument(skip(state, payload))]
 async fn authenticate(
     Extension(state): Extension<Arc<RwLock<AppState>>>,
     Json(payload): Json<AuthenticateRequest>,
 ) -> Result<Response, AuthError> {
+    debug!("authenticating user {:?}", payload.username);
+
     let state = state.read().map_err(|_| AuthError::OperationFailed)?;
 
     if payload.username.is_empty() {
+        warn!("user attempted to authenticate with an empty username");
         return Err(AuthError::MissingCredentials);
     }
 
     if !state.keys.contains_key(&payload.username) {
+        warn!(
+            "user {:?} attempted to authenticate without a valid public key",
+            payload.username
+        );
         return Err(AuthError::InvalidCredentials);
     }
 
-    let public_key = state
-        .keys
-        .get(&payload.username)
-        .ok_or(AuthError::OperationFailed)?;
-    let token = create_token();
+    let public_key = state.keys.get(&payload.username).ok_or_else(|| {
+        error!("error recovering user {:?}'s public key", payload.username);
+        AuthError::OperationFailed
+    })?;
+    let token = create_token()?;
     let encrypted_token = encrypt_token(token, public_key)?;
 
     let body = Json(AuthenticateResponse {
@@ -186,9 +213,12 @@ async fn authenticate(
 }
 
 /// Checks if JWT is valid.
+#[instrument(skip(bearer))]
 async fn validate_token(
     TypedHeader(Authorization(bearer)): TypedHeader<Authorization<Bearer>>,
 ) -> StatusCode {
+    debug!("validating the bearer token");
+
     match jsonwebtoken::decode::<Claims>(
         &bearer.token(),
         &KEYS.decoding,
@@ -200,13 +230,29 @@ async fn validate_token(
 }
 
 /// A route protected by a JWT.
+#[instrument]
 async fn protected_route(_: Claims) -> StatusCode {
-    println!("somebody accessed this!");
+    debug!("user accessed a protected route");
     StatusCode::OK
 }
 
 #[tokio::main]
 async fn main() {
+    // Create the logger
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, "./logs", "skribe.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    let file_layer = tracing_subscriber::fmt::layer().with_writer(non_blocking);
+
+    let console_layer = tracing_subscriber::fmt::layer().with_target(false);
+
+    let subscriber = Registry::default()
+        .with(EnvFilter::new("server=debug"))
+        .with(file_layer)
+        .with(console_layer);
+
+    tracing::subscriber::set_global_default(subscriber).expect("failed to set global default");
+
     let state = Arc::new(RwLock::new(AppState::new()));
 
     let app = Router::new()
@@ -217,6 +263,8 @@ async fn main() {
             post(authenticate).layer(Extension(state.clone())),
         )
         .route("/protected", get(protected_route));
+
+    info!("Starting server at http://localhost:3000");
 
     axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
         .serve(app.into_make_service())
