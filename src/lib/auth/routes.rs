@@ -81,7 +81,7 @@ pub async fn authenticate(
         error!("error recovering user {:?}'s public key", payload.username);
         AuthError::OperationFailed
     })?;
-    let token = create_token()?;
+    let token = create_token(chrono::Utc::now())?;
     let encrypted_token = encrypt_token(token, public_key)?;
 
     let body = Json(AuthenticateResponse {

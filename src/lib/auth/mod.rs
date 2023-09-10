@@ -101,9 +101,8 @@ where
 }
 
 /// Creates a new JWT. The token will expire in one hour.
-pub fn create_token() -> Result<String, AuthError> {
-    let now = chrono::Utc::now().timestamp();
-    let exp = now + (60 * 60);
+pub fn create_token(creation_time: chrono::DateTime<chrono::Utc>) -> Result<String, AuthError> {
+    let exp = creation_time.timestamp() + (60 * 60);
     let claims = Claims { exp: exp as usize };
     let token = jsonwebtoken::encode(&Header::default(), &claims, &KEYS.encoding);
 
