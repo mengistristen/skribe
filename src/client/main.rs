@@ -11,7 +11,7 @@ use skribe::request::AuthenticateRequest;
 use skribe::response::AuthenticateResponse;
 use std::fs;
 use std::path::Path;
-use tracing::{debug, instrument};
+use tracing::debug;
 
 /// The base URL for making API requests.
 static BASE_URL: Lazy<String> =
@@ -162,6 +162,8 @@ fn get_data_base_path() -> anyhow::Result<String> {
 
 /// Calls a protected route using the decrypted auth token.
 fn perform_protected_call(token: &str, client: &reqwest::blocking::Client) -> anyhow::Result<()> {
+    debug!("accessing protected route");
+
     let res = client
         .get(format!("{}/protected", *BASE_URL))
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
